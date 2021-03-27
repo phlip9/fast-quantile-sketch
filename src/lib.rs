@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, iter, mem, slice, vec};
 
 /// Maps a quantile `q \in [0, 1]` into k-weight space. The derivative of `k` is
 /// inversely proportional to the number of samples that can fit into a centroid
@@ -187,6 +187,76 @@ impl Centroid {
     }
 }
 
+impl PartialOrd for Centroid {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(total_cmp_f32(&self.mean, &other.mean))
+    }
+}
+
+impl PartialEq for Centroid {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(total_cmp_f32(&self.mean, &other.mean), Ordering::Equal)
+    }
+}
+
+trait Digest {
+    type CentroidIter: Iterator<Item = Centroid>;
+
+    fn centroids(self) -> Self::CentroidIter;
+    fn is_empty(&self) -> bool;
+    fn count(&self) -> f32;
+    fn min(&self) -> f32;
+    fn max(&self) -> f32;
+}
+
+impl<'a> Digest for &'a [f32] {
+    type CentroidIter = iter::Map<slice::Iter<'a, f32>, fn(&f32) -> Centroid>;
+
+    fn centroids(self) -> Self::CentroidIter {
+        self.into_iter().map(|x| Centroid::unit(*x))
+    }
+
+    fn is_empty(&self) -> bool {
+        <[f32]>::is_empty(self)
+    }
+
+    fn count(&self) -> f32 {
+        self.len() as f32
+    }
+
+    fn min(&self) -> f32 {
+        self[0]
+    }
+
+    fn max(&self) -> f32 {
+        self[self.len() - 1]
+    }
+}
+
+impl Digest for TDigest {
+    type CentroidIter = vec::IntoIter<Centroid>;
+
+    fn centroids(self) -> Self::CentroidIter {
+        self.centroids.into_iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.centroids.is_empty()
+    }
+
+    fn count(&self) -> f32 {
+        self.count
+    }
+
+    fn min(&self) -> f32 {
+        self.min
+    }
+
+    fn max(&self) -> f32 {
+        self.max
+    }
+}
+
 #[derive(Debug)]
 pub struct TDigest {
     centroids: Vec<Centroid>,
@@ -322,7 +392,69 @@ impl TDigest {
         self.max = total_max;
     }
 
-    pub fn merge(&mut self, _digest: TDigest) {}
+    fn merge_v2(&mut self, digest: impl Digest) {
+        if digest.is_empty() {
+            return;
+        }
+
+        let (total_min, total_max) = if self.count > 0.0 {
+            (
+                min_f32(self.min, digest.min()),
+                max_f32(self.max, digest.max()),
+            )
+        } else {
+            (digest.min(), digest.max())
+        };
+
+        let total_count = self.count + digest.count();
+        let mut total_sum = self.sum;
+
+        let mut k_limit: f32 = 1.0;
+        let mut q_limit_times_count = k_inv(k_limit, self.max_size as f32) * total_count;
+        k_limit += 1.0;
+
+        let centroids_1 = mem::replace(&mut self.centroids, Vec::with_capacity(self.max_size));
+        let mut merged = itertools::merge(centroids_1, digest.centroids());
+
+        let mut curr = merged.next().unwrap();
+        let mut prefix_count: f32 = curr.count;
+        let mut sums_to_merge: f32 = 0.0;
+        let mut counts_to_merge: f32 = 0.0;
+
+        for next in merged {
+            let next_sum = next.mean * next.count;
+            prefix_count += next.count;
+
+            if prefix_count <= q_limit_times_count {
+                sums_to_merge += next_sum;
+                counts_to_merge += next.count;
+            } else {
+                total_sum += curr.add(sums_to_merge, counts_to_merge);
+                sums_to_merge = 0.0;
+                counts_to_merge = 0.0;
+
+                self.centroids.push(curr);
+                q_limit_times_count = k_inv(k_limit, self.max_size as f32) * total_count;
+                k_limit += 1.0;
+                curr = next;
+            }
+        }
+
+        self.centroids.push(curr);
+        self.centroids.shrink_to_fit();
+
+        self.count = total_count;
+        self.sum = total_sum;
+        self.min = total_min;
+        self.max = total_max;
+
+        debug_assert!(self.centroids.len() <= self.max_size);
+        debug_assert!(is_sorted_by(self.centroids.iter(), |c1, c2| Some(
+            total_cmp_f32(&c1.mean, &c2.mean)
+        )));
+    }
+
+    pub fn merge(&mut self, _digests: TDigest) {}
 
     #[inline]
     pub fn inv_cdf(&self, q: f32) -> f32 {
@@ -586,13 +718,9 @@ impl TDigest {
         // debug_assert!(count_so_far <= max_rank);
         debug_assert!(count_so_far <= max_rank - 0.5);
 
-        panic!(
-            "fell through loop. can this happen? count_so_far: {:?}",
-            count_so_far
-        );
-
-        // let t = (rank - count_so_far) / (max_rank - count_so_far);
-        // lerp_clamp_f32(self.centroids[n - 1].mean, self.max, t)
+        // can fall through due to accumulated float errors in count_so_far.
+        let t = (rank - count_so_far) / (max_rank - count_so_far);
+        lerp_clamp_f32(self.centroids[n - 1].mean, self.max, t)
     }
 }
 
@@ -600,9 +728,10 @@ impl TDigest {
 mod tests {
     use super::*;
     use approx::{assert_abs_diff_eq, assert_relative_eq, assert_ulps_eq};
+    use itertools::Itertools;
     use proptest::{collection::vec, prelude::*, sample::subsequence};
     use rand::{distributions::Distribution, rngs::SmallRng, SeedableRng};
-    use statrs::distribution::Exponential;
+    use statrs::distribution::{Exponential, Normal};
     use std::{cmp::min, fmt::Debug, ops::Range};
 
     fn arb_small_rng() -> impl Strategy<Value = SmallRng> {
@@ -738,6 +867,43 @@ mod tests {
         lerp_clamp_f32(xs[idx], xs[idx + 1], rank.fract())
     }
 
+    fn sample_distr(
+        rng: &mut SmallRng,
+        distr: impl Distribution<f64>,
+        num_samples: usize,
+    ) -> Vec<f32> {
+        distr
+            .sample_iter(rng)
+            .take(num_samples)
+            .map(|x| x as f32)
+            .collect::<Vec<_>>()
+    }
+
+    fn arb_partitions(
+        len: usize,
+    ) -> impl Strategy<Value = impl Iterator<Item = Range<usize>> + Debug> {
+        let idxs = (1..len).collect::<Vec<_>>();
+        subsequence(idxs, 0..len).prop_map(move |mut idxs| {
+            idxs.push(len);
+            idxs.into_iter().scan(0_usize, |prev, curr| {
+                let range = *prev..curr;
+                *prev = curr;
+                Some(range)
+            })
+        })
+    }
+
+    fn arb_partitioned_samples(
+        distr: impl Distribution<f64> + Copy,
+        max_samples: usize,
+    ) -> impl Strategy<Value = (Vec<f32>, impl Iterator<Item = Range<usize>> + Debug)> {
+        ((1..max_samples), arb_small_rng()).prop_flat_map(move |(num_samples, mut rng)| {
+            let samples = sample_distr(&mut rng, distr, num_samples);
+            let partitions = arb_partitions(num_samples);
+            (Just(samples), partitions)
+        })
+    }
+
     #[test]
     fn test_t_digest_quantile_lossless() {
         let mut digest = TDigest::new_with_size(5);
@@ -765,18 +931,30 @@ mod tests {
     #[test]
     fn test_t_digest_basic_range() {
         let mut digest = TDigest::new_with_size(100);
+        let mut digest2 = TDigest::new_with_size(100);
+
         let n_u16 = 10_000_u16;
         let n = n_u16 as f32;
         let values = (1..=n_u16).map(f32::from).collect::<Vec<_>>();
+
         digest.merge_sorted(&values);
+        digest2.merge_v2(values.as_slice());
 
         assert_relative_eq!(0.99 * n, digest.quantile_v3(0.99), max_relative = 1e-3);
+        assert_relative_eq!(0.99 * n, digest2.quantile_v3(0.99), max_relative = 1e-3);
+
         assert_ulps_eq!(1.0, digest.min);
+        assert_ulps_eq!(1.0, digest2.min);
+
         assert_ulps_eq!(n, digest.max);
+        assert_ulps_eq!(n, digest2.max);
+
         assert_ulps_eq!(n, digest.count);
+        assert_ulps_eq!(n, digest2.count);
 
         // sum_{i=1}^n i = n(n+1)/2
         assert_relative_eq!(0.5 * n * (n + 1.0), digest.sum, max_relative = 1e-3);
+        assert_relative_eq!(0.5 * n * (n + 1.0), digest2.sum, max_relative = 1e-3);
 
         for q in linspace_incl(0.0, 1.0, (n_u16 + 1) as usize) {
             assert_abs_diff_eq!(
@@ -784,6 +962,7 @@ mod tests {
                 digest.quantile_v3(q),
                 epsilon = 1.0,
             );
+            assert_ulps_eq!(digest.quantile_v3(q), digest2.quantile_v3(q));
         }
     }
 
@@ -792,15 +971,13 @@ mod tests {
         let mut rng = small_rng();
         let exp_distr = Exponential::new(1.0).unwrap();
 
-        let mut samples = exp_distr
-            .sample_iter(&mut rng)
-            .take(10000)
-            .map(|x| x as f32)
-            .collect::<Vec<_>>();
+        let mut samples = sample_distr(&mut rng, exp_distr, 10_000);
         sort_unstable_f32(&mut samples);
 
         let mut digest = TDigest::new_with_size(100);
+        let mut digest2 = TDigest::new_with_size(100);
         digest.merge_sorted(&samples);
+        digest2.merge_v2(samples.as_slice());
 
         for q in linspace_incl(0.0, 1.0, 10000 + 1) {
             assert_abs_diff_eq!(
@@ -808,40 +985,8 @@ mod tests {
                 digest.quantile_v3(q),
                 epsilon = 0.5,
             );
+            assert_ulps_eq!(digest.quantile_v3(q), digest2.quantile_v3(q));
         }
-    }
-
-    fn arb_partitions(
-        len: usize,
-    ) -> impl Strategy<Value = impl Iterator<Item = Range<usize>> + Debug> {
-        let idxs = (1..len).collect::<Vec<_>>();
-        subsequence(idxs, 0..len).prop_map(move |mut idxs| {
-            idxs.push(len);
-            idxs.into_iter().scan(0_usize, |prev, curr| {
-                let range = *prev..curr;
-                *prev = curr;
-                Some(range)
-            })
-        })
-    }
-
-    fn sample_exp_distr(rng: &mut SmallRng, lambda: f32, num_samples: usize) -> Vec<f32> {
-        let dist = Exponential::new(lambda as f64).unwrap();
-        dist.sample_iter(rng)
-            .take(num_samples)
-            .map(|x| x as f32)
-            .collect::<Vec<_>>()
-    }
-
-    fn arb_partitioned_exp_samples(
-        max_samples: usize,
-        lambda: f32,
-    ) -> impl Strategy<Value = (Vec<f32>, impl Iterator<Item = Range<usize>> + Debug)> {
-        ((1..max_samples), arb_small_rng()).prop_flat_map(move |(num_samples, mut rng)| {
-            let samples = sample_exp_distr(&mut rng, lambda, num_samples);
-            let partitions = arb_partitions(num_samples);
-            (Just(samples), partitions)
-        })
     }
 
     #[test]
@@ -875,7 +1020,9 @@ mod tests {
         sort_unstable_f32(&mut samples);
 
         let mut digest = TDigest::new_with_size(100);
+        let mut digest2 = TDigest::new_with_size(100);
         digest.merge_sorted(&samples);
+        digest2.merge_v2(samples.as_slice());
 
         for q in linspace_incl(0.0, 1.0, 100 + 1) {
             assert_abs_diff_eq!(
@@ -883,6 +1030,7 @@ mod tests {
                 digest.quantile_v3(q),
                 epsilon = 0.1,
             );
+            assert_ulps_eq!(digest.quantile_v3(q), digest2.quantile_v3(q));
         }
     }
 
@@ -891,21 +1039,108 @@ mod tests {
 
         #[test]
         fn test_t_digest_exp_error_bound(
-            (mut samples, partitions) in arb_partitioned_exp_samples(10000, 1.0)
+            (mut samples, partitions) in arb_partitioned_samples(Exponential::new(1.0).unwrap(), 1000)
         ) {
-            let mut digest = TDigest::new_with_size(100);
+            let mut digest = TDigest::new_with_size(32);
+            let mut digest2 = TDigest::new_with_size(32);
 
             for range in partitions {
                 let partition = &mut samples[range];
                 digest.merge_unsorted(partition);
+                digest2.merge_v2(&*partition);
+
+                assert_ulps_eq!(digest.min, digest2.min);
+                assert_ulps_eq!(digest.max, digest2.max);
+                assert_ulps_eq!(digest.sum, digest2.sum);
+                assert_ulps_eq!(digest.count, digest2.count);
             }
 
             sort_unstable_f32(&mut samples);
+
             for q in linspace_incl(0.0, 1.0, 100 + 1) {
+                assert_abs_diff_eq!(
+                    digest.quantile_v3(q),
+                    digest2.quantile_v3(q),
+                    epsilon = 1e-3,
+                );
+                assert_abs_diff_eq!(
+                    empirical_quantile_v3(&samples, q),
+                    digest.quantile_v3(q),
+                    epsilon = 1.5,
+                );
+            }
+        }
+
+        #[test]
+        fn test_t_digest_gaussian_error_bound(
+            (mut samples, partitions) in arb_partitioned_samples(Normal::new(0.0, 1.0).unwrap(), 1000)
+        ) {
+            let mut digest = TDigest::new_with_size(32);
+            let mut digest2 = TDigest::new_with_size(32);
+
+            for range in partitions {
+                let partition = &mut samples[range];
+                digest.merge_unsorted(partition);
+                digest2.merge_v2(&*partition);
+
+                assert_ulps_eq!(digest.min, digest2.min);
+                assert_ulps_eq!(digest.max, digest2.max);
+                assert_ulps_eq!(digest.sum, digest2.sum);
+                assert_ulps_eq!(digest.count, digest2.count);
+            }
+
+            sort_unstable_f32(&mut samples);
+
+            for q in linspace_incl(0.0, 1.0, 100 + 1) {
+                assert_abs_diff_eq!(
+                    digest.quantile_v3(q),
+                    digest2.quantile_v3(q),
+                    epsilon = 1e-3,
+                );
                 assert_abs_diff_eq!(
                     empirical_quantile_v3(&samples, q),
                     digest.quantile_v3(q),
                     epsilon = 0.5,
+                );
+            }
+        }
+
+        #[test]
+        fn test_t_digest_merge_digest(
+            (mut samples, partitions) in arb_partitioned_samples(Exponential::new(1.0).unwrap(), 1000)
+        ) {
+            let mut digests = Vec::new();
+
+            for range in partitions {
+                let partition = &mut samples[range];
+                let mut digest = TDigest::new_with_size(32);
+                sort_unstable_f32(partition);
+                digest.merge_v2(&*partition);
+                digests.push(digest);
+            }
+
+            let merged_digest = digests.into_iter()
+                .tree_fold1(|mut d1, d2| {
+                    d1.merge_v2(d2);
+                    d1
+                })
+                .unwrap();
+            sort_unstable_f32(&mut samples);
+
+            let mut digest = TDigest::new_with_size(32);
+            digest.merge_v2(samples.as_slice());
+
+            for q in linspace_incl(0.0, 1.0, 100 + 1) {
+                assert_abs_diff_eq!(
+                    empirical_quantile_v3(&samples, q),
+                    merged_digest.quantile_v3(q),
+                    epsilon = 2.0,
+                );
+
+                assert_abs_diff_eq!(
+                    digest.quantile_v3(q),
+                    merged_digest.quantile_v3(q),
+                    epsilon = 2.0,
                 );
             }
         }
