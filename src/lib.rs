@@ -55,7 +55,7 @@ fn k_inv(k: f32, d: f32) -> f32 {
 /// Provides a total ordering over f32's.
 // TODO(philiphayes): use `std::f32::total_cmp` when it stabilizes.
 #[inline]
-fn total_cmp_f32(a: &f32, b: &f32) -> Ordering {
+pub fn total_cmp_f32(a: &f32, b: &f32) -> Ordering {
     let mut a = a.to_bits() as i32;
     let mut b = b.to_bits() as i32;
 
@@ -95,7 +95,7 @@ fn is_sorted_f32(iter: impl Iterator<Item = f32>) -> bool {
 
 /// Sort the slice of `f32`'s according to the total ordering given by
 /// `total_cmp_f32`.
-fn sort_unstable_f32(values: &mut [f32]) {
+pub fn sort_unstable_f32(values: &mut [f32]) {
     values.sort_unstable_by(total_cmp_f32)
 }
 
@@ -161,7 +161,7 @@ fn lerp_clamp_f32(x0: f32, x1: f32, t: f32) -> f32 {
 // TODO(philiphayes): could store the prefix_count here? then we could binary
 // search when computing the quantiles.
 #[derive(Clone, Copy, Debug)]
-struct Centroid {
+pub struct Centroid {
     mean: f32,
     /// use float here to avoid lots of usize <-> float conversions
     count: f32,
@@ -199,7 +199,7 @@ impl PartialEq for Centroid {
     }
 }
 
-trait Digest {
+pub trait Digest {
     type CentroidIter: Iterator<Item = Centroid>;
 
     fn centroids(self) -> Self::CentroidIter;
@@ -209,11 +209,13 @@ trait Digest {
     fn max(&self) -> f32;
 }
 
+// TODO(philiphayes): temporary hack that assumes the slice is always sorted; weight
+// should use a newtype wrapper or something to prove sorted-ness.
 impl<'a> Digest for &'a [f32] {
     type CentroidIter = iter::Map<slice::Iter<'a, f32>, fn(&f32) -> Centroid>;
 
     fn centroids(self) -> Self::CentroidIter {
-        self.into_iter().map(|x| Centroid::unit(*x))
+        self.iter().map(|x| Centroid::unit(*x))
     }
 
     fn is_empty(&self) -> bool {
@@ -257,7 +259,7 @@ impl Digest for TDigest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TDigest {
     centroids: Vec<Centroid>,
     max_size: usize,
@@ -392,7 +394,7 @@ impl TDigest {
         self.max = total_max;
     }
 
-    fn merge_v2(&mut self, digest: impl Digest) {
+    pub fn merge_v2(&mut self, digest: impl Digest) {
         if digest.is_empty() {
             return;
         }
@@ -624,8 +626,8 @@ impl TDigest {
                     0.0
                 };
 
-                dbg!(left_unit);
-                dbg!(right_unit);
+                // dbg!(left_unit);
+                // dbg!(right_unit);
 
                 // distance from center of centroid_i to rank
                 let d1 = rank - count_so_far - left_unit;

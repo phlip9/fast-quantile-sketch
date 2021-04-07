@@ -4,13 +4,16 @@ version = "0.1.0"
 authors = ["Philip Hayes <philiphayes9@gmail.com>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bench]]
+name = "tdigest"
+harness = false
 
 [dependencies]
 itertools = { version = "0.10.0", default-features = false }
 
 [dev-dependencies]
 approx = "0.4.0"
+criterion = "0.3.4"
 proptest = "1.0.0"
 rand = { version = "0.7.3", features = ["small_rng"] }
 statrs = "0.13.0"
